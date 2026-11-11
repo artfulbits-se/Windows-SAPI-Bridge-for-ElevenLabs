@@ -16,6 +16,8 @@
 #include <new>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "json.hpp"
@@ -32,6 +34,7 @@ constexpr GUID waveFormatId{0xc31adbae, 0x527f, 0x4ff5,
                             {0xa2, 0x30, 0xf6, 0x2b, 0xb6, 0x1f, 0xf7, 0x0c}};
 constexpr DWORD sampleRate = 22050;
 constexpr WORD bytesPerSample = 2;
+constexpr auto piperVoiceId = L"en_US-lessac-medium";
 HMODULE module;
 std::atomic<long> moduleReferences{0};
 
@@ -46,12 +49,18 @@ std::string utf8(std::wstring_view text) {
     return result;
 }
 
-Json loadConfig() {
+std::filesystem::path installationDirectory() {
     std::wstring path(32768, L'\0');
     const DWORD length = GetModuleFileNameW(module, path.data(), path.size());
-    if (!length || length == path.size()) return Json::object();
+    if (!length || length == path.size()) return {};
     path.resize(length);
-    std::ifstream file(std::filesystem::path(path).parent_path().parent_path() / L"config.json");
+    return std::filesystem::path(path).parent_path().parent_path();
+}
+
+Json loadConfig() {
+    const auto directory = installationDirectory();
+    if (directory.empty()) return Json::object();
+    std::ifstream file(directory / L"config.json");
     return Json::parse(file);
 }
 
@@ -88,6 +97,165 @@ HRESULT writePcm(ISpTTSEngineSite& site, std::int16_t* samples, DWORD length,
     }
     return writeAudio(site, bytes, complete);
 }
+
+struct CloseKernelHandle {
+    void operator()(HANDLE handle) const { CloseHandle(handle); }
+};
+using KernelHandle = std::unique_ptr<void, CloseKernelHandle>;
+
+bool createWorkerPipe(KernelHandle& reader, KernelHandle& writer, bool parentReads) {
+    SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+    HANDLE readHandle = nullptr;
+    HANDLE writeHandle = nullptr;
+    if (!CreatePipe(&readHandle, &writeHandle, &security, 0)) return false;
+    reader.reset(readHandle);
+    writer.reset(writeHandle);
+    return SetHandleInformation(parentReads ? readHandle : writeHandle, HANDLE_FLAG_INHERIT, 0);
+}
+
+class PiperWorker {
+public:
+    ~PiperWorker() { stop(); }
+
+    HRESULT speak(const std::string& text, long fragmentRate, ULONG volume, ISpTTSEngineSite& site) {
+        if (site.GetActions() & SPVES_ABORT) return S_FALSE;
+        long rate = 0;
+        site.GetRate(&rate);
+        const auto speed = 1.0 + 0.05 * std::clamp(rate + fragmentRate, -10L, 10L);
+        const std::string request = Json{{"text", text}, {"length_scale", 1.0 / speed}}.dump() + "\n";
+        if (request.size() > 1024 * 1024) return E_INVALIDARG;
+        if (!start()) return E_FAIL;
+
+        if (!ready_) {
+            DWORD ready = 0;
+            const auto result = readExact(&ready, sizeof(ready), site);
+            if (result != S_OK || ready != 1) {
+                stop();
+                return result == S_OK ? E_FAIL : result;
+            }
+            ready_ = true;
+        }
+        const auto result = synthesize(request, volume, site);
+        if (result != S_OK) stop();
+        return result;
+    }
+
+private:
+    bool start() {
+        if (process_ && WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT) return true;
+        stop();
+        const auto directory = installationDirectory();
+        if (directory.empty()) return false;
+        const auto piper = directory / L"piper";
+        const auto python = piper / L".venv" / L"Scripts" / L"python.exe";
+        const auto script = piper / L"piper_worker.py";
+        const auto model = piper / (std::wstring(piperVoiceId) + L".onnx");
+
+        KernelHandle childInput, parentInput, parentOutput, childOutput;
+        if (!createWorkerPipe(childInput, parentInput, false) ||
+            !createWorkerPipe(parentOutput, childOutput, true)) return false;
+        SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
+        const auto nullFile = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                         &security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (nullFile == INVALID_HANDLE_VALUE) return false;
+        KernelHandle childErrors(nullFile);
+
+        // Only the three standard handles belong in the child, even if the SAPI client has others.
+        SIZE_T attributeSize = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
+        if (!attributeSize) return false;
+        std::vector<unsigned char> storage(attributeSize);
+        const auto attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+        if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributeSize)) return false;
+        std::unique_ptr<std::remove_pointer_t<LPPROC_THREAD_ATTRIBUTE_LIST>,
+                        decltype(&DeleteProcThreadAttributeList)> list(attributes, DeleteProcThreadAttributeList);
+        HANDLE handles[]{childInput.get(), childOutput.get(), childErrors.get()};
+        if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                       handles, sizeof(handles), nullptr, nullptr)) return false;
+
+        std::wstring command = L"\"" + python.wstring() + L"\" -I -u \"" +
+                               script.wstring() + L"\" \"" + model.wstring() + L"\"";
+        STARTUPINFOEXW startup{};
+        startup.StartupInfo.cb = sizeof(startup);
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = handles[0];
+        startup.StartupInfo.hStdOutput = handles[1];
+        startup.StartupInfo.hStdError = handles[2];
+        startup.lpAttributeList = attributes;
+        PROCESS_INFORMATION process{};
+        if (!CreateProcessW(python.c_str(), command.data(), nullptr, nullptr, TRUE,
+                            EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, piper.c_str(),
+                            &startup.StartupInfo, &process)) return false;
+        CloseHandle(process.hThread);
+        process_.reset(process.hProcess);
+        input_ = std::move(parentInput);
+        output_ = std::move(parentOutput);
+        return true;
+    }
+
+    void stop() {
+        ready_ = false;
+        input_.reset();
+        output_.reset();
+        if (process_ && WaitForSingleObject(process_.get(), 50) == WAIT_TIMEOUT) {
+            TerminateProcess(process_.get(), 1);
+        }
+        process_.reset();
+    }
+
+    HRESULT readExact(void* data, DWORD length, ISpTTSEngineSite& site) {
+        auto bytes = static_cast<unsigned char*>(data);
+        const auto deadline = GetTickCount64() + 20000;
+        while (length) {
+            if (site.GetActions() & SPVES_ABORT) return S_FALSE;
+            if (GetTickCount64() >= deadline) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            DWORD available = 0;
+            if (!PeekNamedPipe(output_.get(), nullptr, 0, nullptr, &available, nullptr)) return E_FAIL;
+            if (!available) {
+                Sleep(5);
+                continue;
+            }
+            DWORD read = 0;
+            if (!ReadFile(output_.get(), bytes, std::min(length, available), &read, nullptr) || !read) {
+                return E_FAIL;
+            }
+            bytes += read;
+            length -= read;
+        }
+        return S_OK;
+    }
+
+    HRESULT synthesize(const std::string& request, ULONG volume, ISpTTSEngineSite& site) {
+        DWORD sent = 0;
+        if (!WriteFile(input_.get(), request.data(), static_cast<DWORD>(request.size()), &sent, nullptr) ||
+            sent != request.size()) return E_FAIL;
+        std::array<std::int16_t, 2048> samples{};
+        unsigned char trailingByte = 0;
+        DWORD remainder = 0;
+        bool spoke = false;
+        for (;;) {
+            DWORD length = 0;
+            auto result = readExact(&length, sizeof(length), site);
+            if (result != S_OK) return result;
+            if (!length) return spoke ? S_OK : E_FAIL;
+            if (length > 32 * 1024 * 1024 || length % bytesPerSample) return E_FAIL;
+            while (length) {
+                const auto amount = std::min(length, static_cast<DWORD>(sizeof(samples)));
+                result = readExact(samples.data(), amount, site);
+                if (result != S_OK) return result;
+                result = writePcm(site, samples.data(), amount, volume, trailingByte, remainder);
+                if (result != S_OK) return result;
+                length -= amount;
+                spoke = true;
+            }
+        }
+    }
+
+    KernelHandle process_;
+    KernelHandle input_;
+    KernelHandle output_;
+    bool ready_ = false;
+};
 
 bool disableRedirects(HINTERNET request) {
     DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
@@ -306,6 +474,17 @@ public:
         if (!token) return E_POINTER;
         if (token_) return E_UNEXPECTED;
         wchar_t* id = nullptr;
+        const HRESULT piperResult = token->GetStringValue(L"PiperVoiceId", &id);
+        if (SUCCEEDED(piperResult) && id) {
+            std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> value(id, CoTaskMemFree);
+            if (std::wstring_view(id) != piperVoiceId) return E_INVALIDARG;
+            piperVoice_ = true;
+            token->AddRef();
+            token_ = token;
+            return S_OK;
+        }
+        CoTaskMemFree(id);
+        id = nullptr;
         const HRESULT result = token->GetStringValue(L"ElevenLabsVoiceId", &id);
         std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> value(id, CoTaskMemFree);
         if (FAILED(result)) return result;
@@ -366,7 +545,8 @@ public:
             }
             const auto encoded = utf8(text);
             if (encoded.empty()) return E_INVALIDARG;
-            const auto result = streamSpeech(voiceId_, encoded, loadConfig(), rate, volume, *site);
+            const auto result = piperVoice_ ? piper_.speak(encoded, rate, volume, *site)
+                                            : streamSpeech(voiceId_, encoded, loadConfig(), rate, volume, *site);
             return result == S_FALSE ? S_OK : result;
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
@@ -379,6 +559,8 @@ private:
     std::atomic<ULONG> references_{1};
     ISpObjectToken* token_ = nullptr;
     std::wstring voiceId_;
+    bool piperVoice_ = false;
+    PiperWorker piper_;
 };
 
 class EngineFactory final : public IClassFactory {

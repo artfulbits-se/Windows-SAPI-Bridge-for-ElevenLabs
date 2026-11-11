@@ -1,336 +1,63 @@
-<a href="https://www.buymeacoffee.com/xTaraRose" target="_blank"><img src="https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&emoji=&slug=xTaraRose&button_colour=BD5FFF&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;"></a>
+# Windows SAPI Bridge for ElevenLabs and Piper
 
-# Windows SAPI Bridge for ElevenLabs
+This fork exposes ElevenLabs cloud voices and an offline Piper voice through 64-bit Windows SAPI5. An application such as ALLPlayer can select either voice from its existing speech synthesizer settings.
 
-> **Seamless ElevenLabs TTS — everywhere Windows speaks.**
+| Voice | Synthesis |
+| --- | --- |
+| `ElevenLabs - Adam - Dominant, Firm` and other ElevenLabs voices | ElevenLabs API. `eleven_v4_turbo` uses the Text to Dialogue WebSocket. `eleven_v4` and other supported HTTP models use the Text to Speech streaming endpoint. |
+| `Piper - Lessac Medium (US English)` | Local Piper 1.8.0 with the `en_US-lessac-medium` model. This voice uses zero ElevenLabs credits and works offline after setup. |
 
----
+The native COM DLL runs inside the 64-bit SAPI application. Piper runs in a child process that loads the model once and streams audio to the DLL over private pipes. The worker exits when the SAPI voice is released. ALLPlayer's reading speed and volume controls apply to Piper. The engine uses one voice per request, so the application controls which voice speaks.
 
-## ⚠️ EXPERIENCING HIGH CPU USAGE? Quick Fix
+## Build and install
 
-If your system is experiencing **persistent high CPU usage from `IAStorDataMgrSvc` or `svchost` processes** after installing or using the SAPI Bridge, this is likely caused by orphaned registry entries from a previous installation.
+Use Windows 10 or 11 on x64, 64-bit PowerShell, and x64 Python 3.9 or later. The build below uses [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases), the [Windows SDK SAPI DDK header](https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/sapiddk.h), and the [nlohmann JSON single header](https://github.com/nlohmann/json/releases/tag/v3.12.0). Put `sapiddk.h` and `json.hpp` in the same include directory. Set `$compiler` to the full path to the x64 llvm-mingw `clang++.exe` and `$includes` to the include directory.
 
-**Quick Fix (2 steps):**
-
-1. **Run the emergency cleanup as Administrator:**
-   ```bash
-   python cleanup_sapi_bridge.py --verbose
-   ```
-
-2. **Restart your computer** — Windows needs to reload the registry
-
-**Verify the fix worked:**
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File verify_cleanup.ps1
+$dll = Join-Path $env:TEMP 'ElevenLabsSapi.dll'
+& $compiler -std=c++17 -O2 -shared -static -I $includes -o $dll `
+  native-sapi/ElevenLabsSapi.cpp native-sapi/ElevenLabsSapi.def `
+  -lole32 -luuid -lwinhttp -lcrypt32
 ```
 
-Expected output: `SUCCESS: System is clean! SAPI Bridge completely removed.`
+Run the installer below from 64-bit PowerShell as Administrator under the same Windows account that will run the speech application. It installs Piper and its English model into a dedicated environment, registers the native DLL for that account, and adds a separate classic SAPI voice token for Piper. For an ElevenLabs-only install, omit `-Piper`.
 
-**Why this happens:** If you've moved SAPI Bridge files to a new location without uninstalling first, or if `uninstall_voices.py` failed to complete, the Windows registry retains broken COM object references. The most common culprit is the orphaned engine **CLSID `{6C0A3A4E-8F2B-4E5D-A3C7-1B9F2E8D4A6C}`** remaining in `HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID`. Windows repeatedly attempts to initialize this broken COM object on startup, causing high CPU cycling.
-
-**For detailed information:** See [CLEANUP_GUIDE.md](CLEANUP_GUIDE.md) and [DIAGNOSTIC_FINDINGS.md](DIAGNOSTIC_FINDINGS.md) for the root cause analysis and advanced troubleshooting.
-
----
-
-## 🚀 Status: Project Pivot → ElevenLabs Speech Synthesis Platform
-
-⚠️ **This SAPI5 Bridge is a Proof of Concept**
-
-After investigating the SAPI5 approach, we discovered fundamental technical limitations with comtypes' LocalServer32 marshaling. Rather than fighting deprecated technology, we've pivoted to something better:
-
-### The New Direction: [ElevenLabs Speech Synthesis Platform](https://github.com/xTaraRose/ElevenLabs-Speech-Synthesis)
-
-A **unified, decentralized platform** with a local Windows Service + plugin ecosystem that works with modern applications (Calibre, NVDA, Windows.Media.SpeechSynthesis, and more).
-
-**Why this approach is better:**
-- 🎯 **Not tied to SAPI5** — which many applications (Calibre, etc.) are abandoning
-- 🔌 **Plugin architecture** — adds ElevenLabs support to any application
-- 👤 **User-owned** — each user provides their own API key (no backend dependency)
-- ⚙️ **Single configuration** — set up once, use everywhere
-- 🔒 **Secure** — encrypted key storage, localhost-only communication
-- 📈 **Future-proof** — uses modern Windows APIs (Windows.Media.SpeechSynthesis)
-
-### What's Happening with This SAPI5 Project
-
-- **WinRT/C# SAPI5 reimplementation** ([`winrt-csharp/`](winrt-csharp/)) — proof of concept, may be explored later
-- **Investigation & diagnostics** ([SAPI_STATUS.md](SAPI_STATUS.md)) — preserved for reference
-- **Current Python implementation** — functional but limited by comtypes
-
-**Priority:** The new [ElevenLabs Speech Synthesis Platform](https://github.com/xTaraRose/ElevenLabs-Speech-Synthesis) is now the primary focus. This repository remains as historical context and a reference for the SAPI5 approach.
-
----
-
-## Why I built this
-
-*by [@xTaraRose](https://github.com/xTaraRose)*
-
-I was tired of trying to find different implementations to integrate ElevenLabs into different apps and always coming up short with nothing straightforward and simple to use.  Especially with using Calibre a lot — there was realistically nothing out there.
-
-The original **Windows SAPI Bridge for ElevenLabs** was my first attempt at solving this problem by integrating at the system level through SAPI5. While it was a good learning experience and successful proof of concept, it highlighted why a different approach was needed.
-
-This experience led to the **ElevenLabs Speech Synthesis Platform** — a more flexible, modern, and sustainable solution that doesn't depend on deprecated technology.
-
----
-
-## What this project does (SAPI5 Implementation)
-
-Windows TTS is built on the **SAPI5** (Speech API) standard.  Every voice on your system — including Microsoft's built-in ones — is just a COM object registered in the Windows registry.  Any application that uses SAPI for text-to-speech will automatically see and be able to use any registered voice.
-
-This project:
-
-1. Registers a lightweight Python COM server (`elevenlabs_engine.py`) as a SAPI5 engine.
-2. Queries your ElevenLabs account and creates one SAPI voice token per voice.
-3. Each token appears in Windows' voice list as `ElevenLabs - <Name>` — indistinguishable from a built-in voice.
-4. When an app speaks, the engine streams raw PCM audio from ElevenLabs and hands it directly to SAPI, which plays it through your audio device.
-
-**Works with any SAPI5-compatible application**, including (but not limited to):
-
-- 📚 E-book readers (e.g. Calibre's Read Aloud)
-- ♿ Screen readers and accessibility tools (e.g. NVDA with SAPI voices, Windows Narrator)
-- 🗣️ Dedicated TTS players (e.g. Balabolka, TTSReader)
-- 🏠 Home automation / custom scripts using the Windows Speech SDK
-- 🎮 Games and applications with built-in narration
-- Any other software that exposes a "voice selection" dropdown powered by Windows TTS
-
----
-
-## Requirements
-
-| Requirement | Notes |
-|---|---|
-| Windows 10 / 11 (64-bit) | 32-bit Windows is not supported |
-| Python 3.8+ (64-bit) | [python.org](https://www.python.org/downloads/) — match the system bitness |
-| ElevenLabs account | Free tier works; paid gives more monthly quota — [click here to sign up](https://try.elevenlabs.io/dr97m3vet6ly) |
-| Internet connection | Audio is streamed in real time |
-
----
-
-## Installation
-
-### 1 — Install Python dependencies
-
-Open a **normal** (non-admin) Command Prompt and run:
-
-```
-pip install comtypes requests
+```powershell
+.\native-sapi\install.ps1 -EngineDll $dll -Piper
 ```
 
-### 2 — Add your ElevenLabs API key
+Fully quit and reopen ALLPlayer, including any tray process. In **Settings → Speech Synthesizer**, enable **Read subtitles, using voice**, select **Piper - Lessac Medium (US English)**, and click **Test the reader**.
 
-Copy `config.example.json` to `config.json` (remove `example` from the filename), then open `config.json` in any text editor and replace `YOUR_API_KEY_HERE` with your key:
+### Add or refresh ElevenLabs voices
+
+Piper setup works without an ElevenLabs account. To add cloud voices, edit `%LOCALAPPDATA%\ElevenLabsSAPI\config.json` with your ElevenLabs API key and model. The installer creates this file from `config.example.json` on first setup. Keep the real key in the local configuration.
 
 ```json
 {
-    "api_key": "sk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-    ...
+  "api_key": "YOUR_API_KEY_HERE",
+  "model_id": "eleven_v4_turbo"
 }
 ```
 
-Keep `config.json` in the **same folder** as the Python scripts.  The engine re-reads it on every Speak call, so changes take effect immediately without reinstalling.
+Run these commands from an administrator PowerShell window under the same Windows account. Run the voice installer again whenever your ElevenLabs voice list changes.
 
-> **Security note:** `config.json` is in `.gitignore` to prevent accidentally committing your real API key to version control.  The `config.example.json` template is safe to commit and shows other users the expected config structure.
-
-### 3 — Run the installer as Administrator
-
-Right-click **Command Prompt** → **Run as administrator**, then:
-
-```
-cd C:\path\to\windows-sapi-bridge-elevenlabs
-python install_voices.py
+```powershell
+python -m pip install -r requirements.txt
+python install_voices.py --native
 ```
 
-Expected output:
+Select an `ElevenLabs - …` entry in ALLPlayer. The bridge rereads the configuration on each cloud utterance, so a model change takes effect on the next subtitle.
 
-```
-Step 1 — Fetching your ElevenLabs voices
-  Found 12 voice(s).
+## Verification and troubleshooting
 
-Step 2 — Registering engine CLSID
-  Engine CLSID : {6C0A3A4E-8F2B-4E5D-A3C7-1B9F2E8D4A6C}
-  LocalServer32: "C:\Python\pythonw.exe" "C:\...\elevenlabs_engine.py"
+- The native engine has generated Adam audio through Windows SAPI using both Eleven v4 and v4 Turbo. Two consecutive Piper requests also produced non-silent 22.05 kHz audio through Windows SAPI. The first request loads the model and can take several seconds.
+- If a new voice is missing, restart the speech application after registration and confirm it is a 64-bit SAPI5 client.
+- For Piper startup errors, check for `piper_worker.py`, `.venv\Scripts\python.exe`, `en_US-lessac-medium.onnx`, and its `.onnx.json` companion in `%LOCALAPPDATA%\ElevenLabsSAPI\piper`. Rerun the native installer with `-Piper` to repair that setup.
+- For cloud errors, check the model ID, API permissions, and available credits. Cloud speech sends the utterance to ElevenLabs. The Piper worker reads only the local model and the text passed over its process pipes.
+- The original Python COM bridge and its cleanup tools remain available. See [SAPI_STATUS.md](SAPI_STATUS.md) for the original marshaling issue and [CLEANUP_GUIDE.md](CLEANUP_GUIDE.md) for legacy registrations.
 
-Step 3 — Registering voice tokens
-  ✓  ElevenLabs - Rachel  [21m00Tcm4TlvDq8ikWAM]
-  ✓  ElevenLabs - Adam    [pNInz6obpgDQGcFmaJgB]
-  ...
+## Credits and licensing
 
-✅  Done!  12 voice(s) registered.
-```
+The bridge is [MIT licensed](LICENSE). The original Windows SAPI bridge was created by [xTaraRose](https://github.com/xTaraRose/Windows-SAPI-Bridge-for-ElevenLabs). The local implementation takes design cues from [Piper SAPI5](https://github.com/mflow888/piper-chromium-sapi5) and runs [OHF Piper](https://github.com/OHF-Voice/piper1-gpl) as a separate GPL-3.0 runtime. Piper and the voice are downloaded at setup time. See the [Lessac Medium model card](https://huggingface.co/rhasspy/piper-voices/blob/main/en/en_US/lessac/medium/MODEL_CARD) for its dataset license.
 
-### 4 — Select a voice in your application
-
-Open any SAPI-compatible application and look for its voice selection — you'll find all your ElevenLabs voices listed as `ElevenLabs - <Name>`.  Select one and it just works.
-
-> The very first sentence takes 1–2 seconds longer while Windows spins up the COM server in the background.  All subsequent speech streams smoothly.
-
----
-
-## Uninstalling
-
-### Standard Uninstall
-
-```
-python uninstall_voices.py
-```
-
-Run as Administrator. This cleanly removes all SAPI registrations. Restart any open SAPI applications afterwards.
-
-### Emergency Cleanup
-
-If you experience issues after uninstalling (such as lingering registry entries, high CPU usage from orphaned services, or the uninstall script failing), use the emergency cleanup utility:
-
-```
-python cleanup_sapi_bridge.py
-```
-
-Run as Administrator. This comprehensive cleanup script:
-- Removes all ElevenLabs voice registrations from the registry
-- Removes the engine CLSID registration
-- Cleans up installation state files
-- Optionally preserves your `config.json` (use `--preserve-config` flag)
-- Verifies that all traces have been removed
-
-**Options:**
-- `--preserve-config` — Keep your config.json file instead of deleting it
-- `--verbose` — Show detailed progress for each removal operation
-
-**Example:**
-```
-python cleanup_sapi_bridge.py --preserve-config --verbose
-```
-
-> **Note:** This utility is especially useful if you've moved the SAPI Bridge files to a new location or if the `.installed_voices.json` state file is missing or corrupted.
-
----
-
-## Updating your voice list
-
-Added or removed voices in your ElevenLabs account?  Just re-run the installer:
-
-```
-python install_voices.py
-```
-
-It overwrites existing entries and adds any new ones.
-
----
-
-## Configuration
-
-All settings live in `config.json`.  Edit the file at any time — changes take effect immediately without re-running the installer.
-
-### Voice quality
-
-| Key | Default | Description |
-|---|---|---|
-| `model_id` | `eleven_multilingual_v2` | TTS model.  `eleven_turbo_v2` is faster with slightly lower quality. |
-| `stability` | `0.5` | `0.0` = more expressive / variable &nbsp; `1.0` = very consistent |
-| `similarity_boost` | `0.75` | How closely to match the original voice character |
-| `style` | `0.0` | Style exaggeration `0`–`1`.  Higher = more dramatic; costs a little more quota. |
-| `use_speaker_boost` | `true` | Subtle quality enhancement.  Disable if you hear audio artefacts. |
-
-### Speed control
-
-| Key | Default | Description |
-|---|---|---|
-| `speed` | `1.0` | Baseline playback speed.  Range: `0.5` (half speed) → `2.0` (double speed). |
-| `sapi_rate_scaling` | `true` | When `true`, the app's own rate/speed slider is also honoured (stacks on top of `speed`). |
-
-**How speed stacking works:**
-SAPI reports rate as an integer from `−10` (slowest) to `+10` (fastest).  With `sapi_rate_scaling` enabled, each unit adds or subtracts **5 %** of the baseline speed.  So if your `speed` is `1.0` and the app sets rate to `+4`, the final speed sent to ElevenLabs is `1.0 × 1.20 = 1.20`.
-
-Set `sapi_rate_scaling` to `false` to ignore the app's rate control and rely solely on the `speed` value — useful when an app sends a non-zero default rate that you want to override.
-
-**Examples:**
-
-```json
-// Normal speed, ignore the app's rate slider
-{ "speed": 1.0, "sapi_rate_scaling": false }
-
-// 20% faster baseline, but still let the app fine-tune
-{ "speed": 1.2, "sapi_rate_scaling": true }
-
-// Slow reader mode
-{ "speed": 0.8, "sapi_rate_scaling": false }
-```
-
----
-
-## Troubleshooting
-
-### Voices don't appear in the application
-
-- Confirm the installer was run **as Administrator**.
-- Restart the application after installing.
-- Open **Registry Editor** (`regedit`) and verify that
-  `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens` contains keys starting with `ElevenLabs_`.
-
-### No audio / silent playback
-
-Check the log at `%APPDATA%\ElevenLabsSAPI\engine.log` for error details.
-
-Common causes:
-
-| Symptom in log | Fix |
-|---|---|
-| `HTTP 401` | Your API key is wrong or expired — update `config.json` |
-| `HTTP 429` | Monthly quota reached — upgrade ElevenLabs plan or wait for reset |
-| `ModuleNotFoundError: comtypes` | Run `pip install comtypes requests` |
-| Python path changed | Re-run `install_voices.py` to update the registry entry |
-
-### Audio plays but the wrong text is spoken (garbled / skipped words)
-
-This usually means the `SPVTEXTFRAG` struct offsets differ from expectations (a rare SAPI version mismatch).  In the log, look for the line that starts `Speaking:` — does it show the correct text?  If not, please open an issue and include the `SPVSTATE size` and `SPVTEXTFRAG size` values printed at startup.
-
-### 32-bit Python warning
-
-Install the **64-bit** Python distribution from [python.org](https://www.python.org/downloads/) and re-run the installer.
-
----
-
-## How the speed system works (technical detail)
-
-```
-User config  ──► speed (0.5 – 2.0, default 1.0)
-                        │
-                        │  if sapi_rate_scaling = true
-                        ▼
-SAPI app rate ──► rate_adj (-10 to +10)
-                        │  multiplier = 1.0 + rate_adj × 0.05
-                        │
-                        ▼
-              final = speed × multiplier   (clamped to 0.5 – 2.0)
-                        │
-                        ▼
-              ElevenLabs API  { "speed": final }
-```
-
----
-
-## Privacy
-
-Text passed to Windows SAPI is forwarded to the ElevenLabs API over HTTPS.
-ElevenLabs' privacy policy applies: <https://elevenlabs.io/privacy>
-
----
-
-## Contributing
-
-Pull requests and issues are welcome.  If you find an application where the
-bridge doesn't work, please open an issue with the application name and version
-and the relevant lines from `engine.log`.
-
----
-
-## Licence
-
-MIT — see `LICENSE` for details.
-
----
-
-*Made with frustration and determination by [@xTaraRose](https://github.com/xTaraRose)*
-
-
----
-
-<a href="https://www.buymeacoffee.com/xTaraRose" target="_blank"><img src="https://img.buymeacoffee.com/button-api/?text=Buy+me+a+coffee&emoji=&slug=xTaraRose&button_colour=BD5FFF&font_colour=ffffff&font_family=Cookie&outline_colour=000000&coffee_colour=FFDD00" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;"></a>
+[Support the original author](https://www.buymeacoffee.com/xTaraRose).

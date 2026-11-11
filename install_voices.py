@@ -9,6 +9,7 @@ MUST be run as Administrator.
 Usage:  python install_voices.py
 """
 
+import argparse
 import sys
 import os
 import json
@@ -144,6 +145,13 @@ def register_voice(voice_id: str, name: str, gender: str) -> str:
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser(description="Register ElevenLabs voices in Windows SAPI.")
+    parser.add_argument(
+        "--native", action="store_true",
+        help="Register voice tokens for the installed 64-bit native engine.",
+    )
+    args = parser.parse_args()
+
     print('╔══════════════════════════════════════════════════════════╗')
     print('║   Windows SAPI Bridge for ElevenLabs — Voice Installer   ║')
     print('╚══════════════════════════════════════════════════════════╝')
@@ -159,11 +167,22 @@ def main():
         print('\nERROR: Open config.json and replace YOUR_API_KEY_HERE with your key.')
         sys.exit(1)
 
-    python_exe  = find_python()
-    engine_path = os.path.join(_script_dir, 'elevenlabs_engine.py')
-    if not os.path.exists(engine_path):
-        print(f'\nERROR: elevenlabs_engine.py not found at {engine_path}')
-        sys.exit(1)
+    if args.native:
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER, f"{CLASSES_CLSID}\\{ENGINE_CLSID}\\InprocServer32",
+                0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+            ) as key:
+                engine_path = winreg.QueryValueEx(key, "")[0]
+            if not os.path.isfile(engine_path):
+                raise FileNotFoundError(engine_path)
+        except FileNotFoundError:
+            parser.error("Install the native engine with native-sapi/install.ps1 first.")
+    else:
+        python_exe = find_python()
+        engine_path = os.path.join(_script_dir, 'elevenlabs_engine.py')
+        if not os.path.exists(engine_path):
+            parser.error(f"elevenlabs_engine.py not found at {engine_path}")
 
     banner('Step 1 — Fetching your ElevenLabs voices')
     try:
@@ -175,7 +194,10 @@ def main():
     print(f'  Found {len(voices)} voice(s).')
 
     banner('Step 2 — Registering engine CLSID')
-    register_engine_clsid(python_exe, engine_path)
+    if args.native:
+        print(f"  InprocServer32: {engine_path}")
+    else:
+        register_engine_clsid(python_exe, engine_path)
 
     banner('Step 3 — Registering voice tokens')
     registered = []
@@ -192,7 +214,8 @@ def main():
     print(f'\n✅  Done!  {len(registered)} voice(s) registered.')
     print('\nThe ElevenLabs voices will now appear in any SAPI5-compatible')
     print('application\'s voice selection — no per-app setup required.')
-    print(f'\nLogs: %APPDATA%\\ElevenLabsSAPI\\engine.log')
+    if not args.native:
+        print(f'\nLogs: %APPDATA%\\ElevenLabsSAPI\\engine.log')
 
 
 if __name__ == '__main__':
