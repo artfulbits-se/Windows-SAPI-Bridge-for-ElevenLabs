@@ -52,10 +52,16 @@ def banner(msg: str):
 
 
 def load_config() -> dict:
-    if not os.path.exists(_config_path):
-        print(f'ERROR: config.json not found at {_config_path}')
+    config_path = _config_path
+    local_app_data = os.environ.get('LOCALAPPDATA')
+    if local_app_data:
+        native_config = os.path.join(local_app_data, 'ElevenLabsSAPI', 'config.json')
+        if os.path.isfile(native_config):
+            config_path = native_config
+    if not os.path.exists(config_path):
+        print(f'ERROR: config.json not found at {config_path}')
         sys.exit(1)
-    with open(_config_path, 'r', encoding='utf-8') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 
