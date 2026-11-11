@@ -34,7 +34,6 @@ constexpr GUID waveFormatId{0xc31adbae, 0x527f, 0x4ff5,
                             {0xa2, 0x30, 0xf6, 0x2b, 0xb6, 0x1f, 0xf7, 0x0c}};
 constexpr DWORD sampleRate = 22050;
 constexpr WORD bytesPerSample = 2;
-constexpr auto piperVoiceId = L"en_US-lessac-medium";
 HMODULE module;
 std::atomic<long> moduleReferences{0};
 
@@ -117,14 +116,15 @@ class PiperWorker {
 public:
     ~PiperWorker() { stop(); }
 
-    HRESULT speak(const std::string& text, long fragmentRate, ULONG volume, ISpTTSEngineSite& site) {
+    HRESULT speak(const std::wstring& voiceId, const std::string& text,
+                  long fragmentRate, ULONG volume, ISpTTSEngineSite& site) {
         if (site.GetActions() & SPVES_ABORT) return S_FALSE;
         long rate = 0;
         site.GetRate(&rate);
         const auto speed = 1.0 + 0.05 * std::clamp(rate + fragmentRate, -10L, 10L);
         const std::string request = Json{{"text", text}, {"length_scale", 1.0 / speed}}.dump() + "\n";
         if (request.size() > 1024 * 1024) return E_INVALIDARG;
-        if (!start()) return E_FAIL;
+        if (!start(voiceId)) return E_FAIL;
 
         if (!ready_) {
             DWORD ready = 0;
@@ -141,7 +141,7 @@ public:
     }
 
 private:
-    bool start() {
+    bool start(const std::wstring& voiceId) {
         if (process_ && WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT) return true;
         stop();
         const auto directory = installationDirectory();
@@ -149,7 +149,7 @@ private:
         const auto piper = directory / L"piper";
         const auto python = piper / L".venv" / L"Scripts" / L"python.exe";
         const auto script = piper / L"piper_worker.py";
-        const auto model = piper / (std::wstring(piperVoiceId) + L".onnx");
+        const auto model = piper / (voiceId + L".onnx");
 
         KernelHandle childInput, parentInput, parentOutput, childOutput;
         if (!createWorkerPipe(childInput, parentInput, false) ||
@@ -474,18 +474,13 @@ public:
         if (!token) return E_POINTER;
         if (token_) return E_UNEXPECTED;
         wchar_t* id = nullptr;
-        const HRESULT piperResult = token->GetStringValue(L"PiperVoiceId", &id);
-        if (SUCCEEDED(piperResult) && id) {
-            std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> value(id, CoTaskMemFree);
-            if (std::wstring_view(id) != piperVoiceId) return E_INVALIDARG;
-            piperVoice_ = true;
-            token->AddRef();
-            token_ = token;
-            return S_OK;
+        HRESULT result = token->GetStringValue(L"PiperVoiceId", &id);
+        const bool piperVoice = SUCCEEDED(result) && id;
+        if (!piperVoice) {
+            CoTaskMemFree(id);
+            id = nullptr;
+            result = token->GetStringValue(L"ElevenLabsVoiceId", &id);
         }
-        CoTaskMemFree(id);
-        id = nullptr;
-        const HRESULT result = token->GetStringValue(L"ElevenLabsVoiceId", &id);
         std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> value(id, CoTaskMemFree);
         if (FAILED(result)) return result;
         if (!id || !*id || std::wstring_view(id).find_first_not_of(
@@ -498,6 +493,7 @@ public:
         } catch (const std::bad_alloc&) {
             return E_OUTOFMEMORY;
         }
+        piperVoice_ = piperVoice;
         token->AddRef();
         token_ = token;
         return S_OK;
@@ -545,7 +541,7 @@ public:
             }
             const auto encoded = utf8(text);
             if (encoded.empty()) return E_INVALIDARG;
-            const auto result = piperVoice_ ? piper_.speak(encoded, rate, volume, *site)
+            const auto result = piperVoice_ ? piper_.speak(voiceId_, encoded, rate, volume, *site)
                                             : streamSpeech(voiceId_, encoded, loadConfig(), rate, volume, *site);
             return result == S_FALSE ? S_OK : result;
         } catch (const std::bad_alloc&) {

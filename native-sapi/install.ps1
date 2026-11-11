@@ -22,6 +22,12 @@ $native = Join-Path $install 'native'
 $null = New-Item -ItemType Directory -Path $native -Force
 
 if ($Piper) {
+    $voices = @(
+        @{ Id = 'en_US-lessac-medium'; Name = 'Lessac Medium (US English)'; Language = '409'; Gender = 'Male' }
+        @{ Id = 'en_US-amy-medium'; Name = 'Amy Medium (US English)'; Language = '409'; Gender = 'Female' }
+        @{ Id = 'en_GB-alan-medium'; Name = 'Alan Medium (UK English)'; Language = '809'; Gender = 'Male' }
+        @{ Id = 'en_GB-alba-medium'; Name = 'Alba Medium (UK English)'; Language = '809'; Gender = 'Female' }
+    )
     $piperDirectory = Join-Path $install 'piper'
     $null = New-Item -ItemType Directory -Path $piperDirectory -Force
     $venv = Join-Path $piperDirectory '.venv'
@@ -32,11 +38,23 @@ if ($Piper) {
     }
     & $piperPython -m pip install --disable-pip-version-check 'piper-tts==1.8.0'
     if ($LASTEXITCODE -ne 0) { throw 'Could not install the Piper runtime.' }
-    $model = 'en_US-lessac-medium'
-    if (-not (Test-Path -LiteralPath (Join-Path $piperDirectory "$model.onnx") -PathType Leaf) -or
-        -not (Test-Path -LiteralPath (Join-Path $piperDirectory "$model.onnx.json") -PathType Leaf)) {
-        & $piperPython -m piper.download_voices --data-dir $piperDirectory $model
-        if ($LASTEXITCODE -ne 0) { throw 'Could not download the English Piper model.' }
+    $missingModels = @(foreach ($voice in $voices) {
+        $model = Join-Path $piperDirectory ($voice.Id + '.onnx')
+        if (-not (Test-Path -LiteralPath $model -PathType Leaf) -or
+            -not (Test-Path -LiteralPath "$model.json" -PathType Leaf)) {
+            $voice.Id
+        }
+    })
+    if ($missingModels.Count) {
+        & $piperPython -m piper.download_voices --data-dir $piperDirectory @missingModels
+        if ($LASTEXITCODE -ne 0) { throw 'Could not download the English Piper models.' }
+    }
+    foreach ($voice in $voices) {
+        $metadata = Join-Path $piperDirectory ($voice.Id + '.onnx.json')
+        $rate = & $piperPython -I -c "import json, sys; print(json.load(open(sys.argv[1], encoding='utf-8'))['audio']['sample_rate'])" $metadata
+        if ($LASTEXITCODE -ne 0 -or $rate -ne '22050') {
+            throw "The Piper model $($voice.Id) must produce 22.05 kHz audio."
+        }
     }
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'piper_worker.py') -Destination $piperDirectory -Force
 }
@@ -74,25 +92,29 @@ try {
 } finally { $engine.Dispose(); $user.Dispose() }
 
 if ($Piper) {
-    $display = 'Piper - Lessac Medium (US English)'
-    $tokenPath = 'SOFTWARE\Microsoft\Speech\Voices\Tokens\Piper_en_US_lessac_medium'
     $machine = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
-    $token = $machine.CreateSubKey($tokenPath)
     try {
-        $registered = $token.GetValue('CLSID')
-        if ($registered -and $registered -ne $clsid) { throw 'Another engine owns the Lessac token.' }
-        $token.SetValue('', $display)
-        $token.SetValue('PiperVoiceId', $model)
-        $attributes = $token.CreateSubKey('Attributes')
-        try {
-            $attributes.SetValue('Name', $display)
-            $attributes.SetValue('Vendor', 'Piper')
-            $attributes.SetValue('Language', '409')
-            $attributes.SetValue('Gender', 'Female')
-            $attributes.SetValue('Age', 'Adult')
-        } finally { $attributes.Dispose() }
-        $token.SetValue('CLSID', $clsid)
-    } finally { $token.Dispose(); $machine.Dispose() }
-    Write-Output "Registered $display."
+        foreach ($voice in $voices) {
+            $display = 'Piper - ' + $voice.Name
+            $tokenPath = 'SOFTWARE\Microsoft\Speech\Voices\Tokens\Piper_' + $voice.Id.Replace('-', '_')
+            $token = $machine.CreateSubKey($tokenPath)
+            try {
+                $registered = $token.GetValue('CLSID')
+                if ($registered -and $registered -ne $clsid) { throw "Another engine owns the token for $display." }
+                $token.SetValue('', $display)
+                $token.SetValue('PiperVoiceId', $voice.Id)
+                $attributes = $token.CreateSubKey('Attributes')
+                try {
+                    $attributes.SetValue('Name', $display)
+                    $attributes.SetValue('Vendor', 'Piper')
+                    $attributes.SetValue('Language', $voice.Language)
+                    $attributes.SetValue('Gender', $voice.Gender)
+                    $attributes.SetValue('Age', 'Adult')
+                } finally { $attributes.Dispose() }
+                $token.SetValue('CLSID', $clsid)
+            } finally { $token.Dispose() }
+            Write-Output "Registered $display."
+        }
+    } finally { $machine.Dispose() }
 }
 Write-Output "Registered native SAPI engine at $dll."
