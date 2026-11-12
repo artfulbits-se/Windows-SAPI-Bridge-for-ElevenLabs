@@ -12,26 +12,78 @@ The native COM DLL runs inside the 64-bit SAPI application. Piper runs in a chil
 
 ## Build and install
 
-Use Windows 10 or 11 on x64, 64-bit PowerShell, and x64 Python 3.9 or later. The build below uses [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases), the [Windows SDK SAPI DDK header](https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/sapiddk.h), and the [nlohmann JSON single header](https://github.com/nlohmann/json/releases/tag/v3.12.0). Put `sapiddk.h` and `json.hpp` in the same include directory. Set `$compiler` to the full path to the x64 llvm-mingw `clang++.exe` and `$includes` to the include directory.
+Use Windows 10 or 11 on x64, 64-bit PowerShell, Git, and 64-bit Python 3.9 or later on `PATH`. You need internet access during setup to download the compiler, headers, and any Piper models you install. Run ALLPlayer or another 64-bit SAPI5 application under the Windows account that installs the bridge.
+
+### 1. Clone the fork
+
+Open PowerShell in the directory where you want the source checkout.
 
 ```powershell
-$dll = Join-Path $env:TEMP 'ElevenLabsSapi.dll'
+git clone https://github.com/artfulbits-se/Windows-SAPI-Bridge-for-ElevenLabs.git
+Set-Location Windows-SAPI-Bridge-for-ElevenLabs
+```
+
+### 2. Build the native engine
+
+Run this block from the repository root. It downloads the tested versions of [llvm-mingw](https://github.com/mstorsjo/llvm-mingw/releases/tag/20261104), the [SAPI DDK header](https://github.com/microsoft/win32metadata/blob/9cf94833626504b330c2f616ce71a2d3497cdc76/generation/WinSDK/RecompiledIdlHeaders/um/sapiddk.h), and [nlohmann JSON](https://github.com/nlohmann/json/releases/tag/v3.12.0). The compiler download is about 182 MiB and is reused on subsequent builds.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$build = Join-Path $env:TEMP 'ElevenLabsSapiBuild'
+$includes = Join-Path $build 'include'
+New-Item -ItemType Directory -Path $includes -Force | Out-Null
+
+$toolchain = 'llvm-mingw-20261104-ucrt-x86_64'
+$compiler = Join-Path $build "$toolchain\bin\clang++.exe"
+if (-not (Test-Path -LiteralPath $compiler)) {
+    $archive = Join-Path $build "$toolchain.zip"
+    Invoke-WebRequest -UseBasicParsing `
+        -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/20261104/$toolchain.zip" `
+        -OutFile $archive
+    if ((Get-FileHash -LiteralPath $archive).Hash -ne '552191b5754c49a5a20723276a6fc56541ea1922c4c50b7b669022333fc1b40f') {
+        throw 'The LLVM-MinGW archive checksum did not match.'
+    }
+    tar.exe -xf $archive -C $build
+    if ($LASTEXITCODE -ne 0) { throw 'Could not extract LLVM-MinGW.' }
+}
+
+Invoke-WebRequest -UseBasicParsing `
+    -Uri 'https://raw.githubusercontent.com/microsoft/win32metadata/9cf94833626504b330c2f616ce71a2d3497cdc76/generation/WinSDK/RecompiledIdlHeaders/um/sapiddk.h' `
+    -OutFile (Join-Path $includes 'sapiddk.h')
+Invoke-WebRequest -UseBasicParsing `
+    -Uri 'https://raw.githubusercontent.com/nlohmann/json/v3.12.0/single_include/nlohmann/json.hpp' `
+    -OutFile (Join-Path $includes 'json.hpp')
+
+$dll = Join-Path $build 'ElevenLabsSapi.dll'
 & $compiler -std=c++17 -O2 -shared -static -I $includes -o $dll `
   native-sapi/ElevenLabsSapi.cpp native-sapi/ElevenLabsSapi.def `
   -lole32 -luuid -lwinhttp -lcrypt32
+if ($LASTEXITCODE -ne 0) { throw 'The native engine build failed.' }
+Get-Item -LiteralPath $dll
 ```
 
-Run the installer below from 64-bit PowerShell as Administrator under the same Windows account that will run the speech application. It installs Piper 1.8.0 and its English models into a dedicated environment, registers the native DLL for that account, and adds one classic SAPI token per voice. Run the same command with a rebuilt DLL to update an existing Piper installation. For an ElevenLabs-only install, omit `-Piper`.
+### 3. Install the engine and Piper voices
+
+Open **64-bit PowerShell as Administrator** under the same Windows account. Change to the repository root again and run the installer.
 
 ```powershell
+$dll = Join-Path $env:TEMP 'ElevenLabsSapiBuild\ElevenLabsSapi.dll'
 .\native-sapi\install.ps1 -EngineDll $dll -Piper
 ```
 
-Fully quit and reopen ALLPlayer, including any tray process. In **Settings → Speech Synthesizer**, enable **Read subtitles, using voice**, select a **Piper** voice, and click **Test the reader**.
+This registers the native DLL for your account and installs the four English Piper voices. The installer downloads Piper and the models into `%LOCALAPPDATA%\ElevenLabsSAPI\piper`. If Python is installed outside `PATH`, pass its executable path with `-Python`.
 
-### Add or refresh ElevenLabs voices
+For **ElevenLabs only**, run the same command without `-Piper` and continue to step 4. For **Piper only**, skip to step 5. To use both, keep `-Piper` and continue to step 4.
 
-Piper setup works without an ElevenLabs account. To add cloud voices, edit `%LOCALAPPDATA%\ElevenLabsSAPI\config.json` with your ElevenLabs API key and model. The installer creates this file from `config.example.json` on first setup. Keep the real key in the local configuration.
+### 4. Add ElevenLabs voices (optional)
+
+The native installer creates `%LOCALAPPDATA%\ElevenLabsSAPI\config.json` on first setup. Open it and set `api_key` to a key with permission to list voices and synthesize speech. Set `model_id` to `eleven_v4_turbo` for v4 Turbo or `eleven_v4` for v4. The key belongs in this local file.
+
+```powershell
+notepad.exe (Join-Path $env:LOCALAPPDATA 'ElevenLabsSAPI\config.json')
+```
+
+Set these two fields in the existing JSON file.
 
 ```json
 {
@@ -40,14 +92,35 @@ Piper setup works without an ElevenLabs account. To add cloud voices, edit `%LOC
 }
 ```
 
-Run these commands from an administrator PowerShell window under the same Windows account. Run the voice installer again whenever your ElevenLabs voice list changes.
+After saving the file, run the voice registration commands from the repository root in the same administrator PowerShell window.
 
 ```powershell
-python -m pip install -r requirements.txt
-python install_voices.py --native
+python -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+& .\.venv\Scripts\python.exe install_voices.py --native
 ```
 
-Select an `ElevenLabs - …` entry in ALLPlayer. The bridge rereads the configuration on each cloud utterance, so a model change takes effect on the next subtitle.
+Run `install_voices.py --native` again when your ElevenLabs voice list changes. The bridge rereads `model_id` for each cloud utterance, so changing the model takes effect on the next subtitle.
+
+### 5. Verify the voices
+
+Fully quit and reopen ALLPlayer, including any tray process. In **Settings → Speech Synthesizer**, enable **Read subtitles, using voice**, select a **Piper** or **ElevenLabs** voice, and click **Test the reader**. The first Piper request loads its model and may take several seconds.
+
+You can list the registered voices from a normal 64-bit PowerShell window under the same account.
+
+```powershell
+$speech = New-Object -ComObject SAPI.SpVoice
+foreach ($vendor in 'Piper', 'ElevenLabs') {
+    $voices = $speech.GetVoices("Vendor=$vendor", '')
+    for ($index = 0; $index -lt $voices.Count; $index++) {
+        $voices.Item($index).GetDescription()
+    }
+}
+```
+
+### Update an existing installation
+
+Pull the latest changes from the fork, repeat the build in step 2, and rerun the installer in step 3 with the same voice options. Restart ALLPlayer after installation.
 
 ## Verification and troubleshooting
 
